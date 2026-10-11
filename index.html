@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asbestos Survey Mapper</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#1f5fbf">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<!--
+  Asbestos Survey Mapper - one file, no library, no server, no network.
+
+  Open this file on a phone or computer, pick the floor plan image, draw the
+  homogeneous areas (HAs) and drop the sample points, then Export. The export
+  is a GeoJSON text file whose coordinates are pixels on the plan image
+  (origin top-left, y down). Nothing leaves the device until the surveyor
+  shares the exported file.
+
+  Your work is saved in the browser as you go (localStorage), keyed by the
+  plan's filename, so a reload or an accidental close does not lose it.
+-->
+<style>
+  :root { --ink: #1c2330; --line: #d0d5dd; --bg: #f6f7f9; --accent: #1f5fbf; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--ink); background: var(--bg); }
+  header { padding: 10px 12px; background: #fff; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0 0 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .row label { font-size: 13px; color: #555; }
+  input[type=text] { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
+  #job { width: 90px; } #level { width: 130px; }
+  button { font: inherit; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .tools { padding: 8px 12px; background: #fff; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  .tools button.tool.active { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1px solid rgba(0,0,0,.25); }
+  #status { padding: 8px 12px; font-size: 14px; color: #444; background: #fffbe6; border-bottom: 1px solid #f0e2a0; min-height: 36px; }
+  #stage { position: relative; width: 100%; background: #fff; display: none; touch-action: manipulation; }
+  #plan { display: block; width: 100%; height: auto; user-select: none; -webkit-user-drag: none; }
+  #overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #overlay * { pointer-events: none; }
+  #empty { padding: 28px 16px; text-align: center; color: #555; }
+  #empty input { display: none; }
+  #list { padding: 8px 12px 100px; }
+  #list h2 { font-size: 15px; margin: 12px 0 6px; }
+  .item { display: flex; align-items: center; gap: 8px; padding: 8px; background: #fff; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; font-size: 14px; }
+  .item .txt { flex: 1; min-width: 0; }
+  .item small { color: #666; }
+  .item button { padding: 4px 8px; font-size: 13px; }
+  footer { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px; background: #fff; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: space-between; z-index: 5; }
+  /* modal form */
+  #modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: flex-end; justify-content: center; z-index: 20; }
+  #modal form { background: #fff; width: 100%; max-width: 520px; border-radius: 14px 14px 0 0; padding: 16px; }
+  #modal h3 { margin: 0 0 10px; font-size: 17px; }
+  #modal .field { margin-bottom: 10px; }
+  #modal .field label { display: block; font-size: 13px; color: #555; margin-bottom: 3px; }
+  #modal .field input, #modal .field select { width: 100%; font: inherit; padding: 8px; border: 1px solid var(--line); border-radius: 6px; }
+  #modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+  .help { font-size: 13px; color: #666; padding: 0 12px 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Asbestos Survey Mapper <small id="offline" style="font-weight:400;font-size:12px;color:#777"></small></h1>
+  <div class="row">
+    <label>Job # <input id="job" type="text" placeholder="26-218" inputmode="numeric"></label>
+    <label>Floor / level <input id="level" type="text" placeholder="Basement"></label>
+    <button id="pickBtn" type="button">Choose plan image</button>
+    <input id="file" type="file" accept="image/*" style="display:none">
+  </div>
+</header>
+
+<div class="tools row">
+  <button class="tool" data-tool="floor"><span class="sw" style="background:#3b82f6"></span>Floor</button>
+  <button class="tool" data-tool="ceiling"><span class="sw" style="background:#8b5cf6"></span>Ceiling</button>
+  <button class="tool" data-tool="wall"><span class="sw" style="background:#f97316"></span>Wall</button>
+  <button class="tool" data-tool="pipe"><span class="sw" style="background:#16a34a"></span>Pipe</button>
+  <button class="tool" data-tool="sample"><span class="sw" style="background:#111"></span>Sample</button>
+  <span style="flex:1"></span>
+  <button id="undoBtn" type="button" disabled>Undo point</button>
+  <button id="doneBtn" type="button" class="primary" disabled>Done</button>
+  <button id="cancelBtn" type="button" disabled>Cancel</button>
+</div>
+
+<div id="status">Choose the floor plan image to begin.</div>
+
+<div id="empty">
+  <p>Pick the plan image from your photos. It stays on this device.</p>
+</div>
+
+<div id="stage">
+  <img id="plan" alt="floor plan">
+  <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+</div>
+
+<div class="help">
+  Pick a tool, then tap the plan. Floor and Ceiling are areas: tap each corner, then Done.
+  Wall and Pipe are lines: tap along them, then Done. Sample is one tap. Pinch to zoom in before tapping.
+</div>
+
+<div id="list"></div>
+
+<footer>
+  <button id="clearBtn" type="button">Clear all</button>
+  <button id="exportBtn" type="button" class="primary" disabled>Export file</button>
+</footer>
+
+<div id="modal">
+  <form id="form">
+    <h3 id="formTitle">Details</h3>
+    <div id="formFields"></div>
+    <div class="actions">
+      <button type="button" id="formCancel">Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var COLORS = { floor: '#3b82f6', ceiling: '#8b5cf6', wall: '#f97316', pipe: '#16a34a' };
+  var AREA = { floor: true, ceiling: true, wall: false, pipe: false };
+
+  var state = {
+    planName: null, W: 0, H: 0,
+    features: [],          // {id, kind:'ha'|'sample', surface, ha, material, room, sample, coords}
+    tool: null, drawing: []
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var plan = $('plan'), overlay = $('overlay'), stage = $('stage'), status = $('status');
+
+  // ---------- plan image ----------
+  $('pickBtn').addEventListener('click', function () { $('file').click(); });
+  $('file').addEventListener('change', function (e) {
+    var f = e.target.files && e.target.files[0];
+    if (!f) return;
+    var reader = new FileReader();
+    reader.onload = function (ev) { setPlan(ev.target.result, f.name); };
+    reader.readAsDataURL(f);
+  });
+
+  // Also used by the test harness: setPlan(url, name).
+  function setPlan(src, name) {
+    plan.onload = function () {
+      state.W = plan.naturalWidth; state.H = plan.naturalHeight;
+      state.planName = name;
+      overlay.setAttribute('viewBox', '0 0 ' + state.W + ' ' + state.H);
+      stage.style.display = 'block';
+      $('empty').style.display = 'none';
+      $('exportBtn').disabled = false;
+      restore();
+      render();
+      say('Plan loaded (' + state.W + ' x ' + state.H + ' px). Pick a tool and tap the plan.');
+    };
+    plan.src = src;
+  }
+  window.__setPlan = setPlan;
+
+  // ---------- tools ----------
+  var toolBtns = document.querySelectorAll('button.tool');
+  Array.prototype.forEach.call(toolBtns, function (b) {
+    b.addEventListener('click', function () { selectTool(b.getAttribute('data-tool')); });
+  });
+
+  function selectTool(t) {
+    if (!state.planName) { say('Choose the plan image first.'); return; }
+    if (state.drawing.length) { cancelDrawing(); }
+    state.tool = t;
+    Array.prototype.forEach.call(toolBtns, function (b) {
+      b.classList.toggle('active', b.getAttribute('data-tool') === t);
+    });
+    if (t === 'sample') say('Tap where the sample was taken.');
+    else if (AREA[t]) say('Tap each corner of the ' + t + ' area, then Done.');
+    else say('Tap along the ' + t + ', then Done.');
+    updateButtons();
+  }
+
+  function updateButtons() {
+    var n = state.drawing.length, t = state.tool;
+    $('undoBtn').disabled = n === 0;
+    $('cancelBtn').disabled = n === 0;
+    $('doneBtn').disabled = !(t && t !== 'sample' && n >= (AREA[t] ? 3 : 2));
+  }
+
+  // ---------- tapping ----------
+  overlay.addEventListener('click', function (e) {
+    if (!state.tool) { say('Pick a tool first.'); return; }
+    var r = overlay.getBoundingClientRect();
+    var x = Math.round((e.clientX - r.left) * state.W / r.width);
+    var y = Math.round((e.clientY - r.top) * state.H / r.height);
+    x = Math.max(0, Math.min(state.W, x)); y = Math.max(0, Math.min(state.H, y));
+    if (state.tool === 'sample') { askSample([x, y]); return; }
+    state.drawing.push([x, y]);
+    say(state.drawing.length + ' point' + (state.drawing.length === 1 ? '' : 's') + '. Keep tapping, or press Done.');
+    updateButtons(); render();
+  });
+
+  $('undoBtn').addEventListener('click', function () { state.drawing.pop(); updateButtons(); render(); });
+  $('cancelBtn').addEventListener('click', cancelDrawing);
+  function cancelDrawing() { state.drawing = []; updateButtons(); render(); say('Cancelled.'); }
+
+  $('doneBtn').addEventListener('click', function () {
+    var t = state.tool, pts = state.drawing.slice();
+    askHA(t, pts);
+  });
+
+  // ---------- forms ----------
+  function nextHA() {
+    var m = 0; state.features.forEach(function (f) { if (f.kind === 'ha' && f.ha > m) m = f.ha; });
+    return m + 1;
+  }
+  function nextSample() {
+    var m = 0; state.features.forEach(function (f) {
+      if (f.kind === 'sample') { var n = parseInt(f.sample, 10); if (n > m) m = n; }
+    });
+    return pad(m + 1);
+  }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+  function askHA(surface, pts) {
+    openForm((AREA[surface] ? 'Area' : 'Line') + ': ' + surface, [
+      { id: 'ha', label: 'HA number (homogeneous area)', value: nextHA(), type: 'number', required: true },
+      { id: 'material', label: 'Material (e.g. 9x9 grey floor tile)', value: '', required: true },
+      { id: 'room', label: 'Room (e.g. Recreation room)', value: '' }
+    ], function (v) {
+      state.features.push({ id: uid(), kind: 'ha', surface: surface, ha: parseInt(v.ha, 10),
+        material: v.material.trim(), room: v.room.trim(), coords: pts });
+      state.drawing = []; updateButtons(); save(); render();
+      say('Saved HA ' + v.ha + ' (' + surface + '). Add samples with the Sample tool, or draw the next area.');
+    });
+  }
+
+  function askSample(pt) {
+    var hit = findHA(pt);
+    var haOpts = state.features.filter(function (f) { return f.kind === 'ha'; })
+      .map(function (f) { return { value: f.ha, label: 'HA ' + f.ha + ' - ' + f.material + ' (' + f.surface + ')' }; });
+    if (!haOpts.length) { say('Draw the area or line the sample belongs to first, then drop the sample.'); return; }
+    openForm('Sample point', [
+      { id: 'sample', label: 'Sample number, exactly as on the chain of custody', value: nextSample(), required: true },
+      { id: 'ha', label: 'Belongs to HA', type: 'select', options: haOpts, value: hit ? hit.ha : haOpts[0].value }
+    ], function (v) {
+      state.features.push({ id: uid(), kind: 'sample', sample: v.sample.trim(), ha: parseInt(v.ha, 10), coords: pt });
+      save(); render();
+      say('Saved sample ' + v.sample + ' in HA ' + v.ha + '.');
+    });
+  }
+
+  var formCb = null;
+  function openForm(title, fields, cb) {
+    $('formTitle').textContent = title;
+    var html = '';
+    fields.forEach(function (f) {
+      html += '<div class="field"><label for="f_' + f.id + '">' + f.label + '</label>';
+      if (f.type === 'select') {
+        html += '<select id="f_' + f.id + '" name="' + f.id + '">';
+        f.options.forEach(function (o) {
+          html += '<option value="' + o.value + '"' + (String(o.value) === String(f.value) ? ' selected' : '') + '>' + esc(o.label) + '</option>';
+        });
+        html += '</select>';
+      } else {
+        html += '<input id="f_' + f.id + '" name="' + f.id + '" type="' + (f.type || 'text') + '" value="' + esc(String(f.value)) + '"' +
+                (f.required ? ' required' : '') + (f.type === 'number' ? ' min="1" inputmode="numeric"' : '') + '>';
+      }
+      html += '</div>';
+    });
+    $('formFields').innerHTML = html;
+    formCb = cb;
+    $('modal').style.display = 'flex';
+    var first = $('formFields').querySelector('input[type=text]');
+    if (first) { setTimeout(function () { first.focus(); }, 50); }
+  }
+  $('form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var v = {};
+    Array.prototype.forEach.call($('formFields').querySelectorAll('input,select'), function (el) { v[el.name] = el.value; });
+    $('modal').style.display = 'none';
+    var cb = formCb; formCb = null; if (cb) cb(v);
+  });
+  $('formCancel').addEventListener('click', function () { $('modal').style.display = 'none'; formCb = null; });
+
+  // ---------- geometry ----------
+  function findHA(pt) {
+    var areas = state.features.filter(function (f) { return f.kind === 'ha'; });
+    var i, f, best = null, bestD = state.W / 40;
+    for (i = 0; i < areas.length; i++) {
+      f = areas[i];
+      if (AREA[f.surface] && inPolygon(pt, f.coords)) return f;
+    }
+    for (i = 0; i < areas.length; i++) {
+      f = areas[i];
+      if (!AREA[f.surface]) { var d = distToLine(pt, f.coords); if (d < bestD) { bestD = d; best = f; } }
+    }
+    return best;
+  }
+  function inPolygon(p, poly) {
+    var inside = false, n = poly.length;
+    for (var i = 0, j = n - 1; i < n; j = i++) {
+      var xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+      if (((yi > p[1]) !== (yj > p[1])) && (p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+  function distToLine(p, pts) {
+    var best = Infinity;
+    for (var i = 0; i + 1 < pts.length; i++) best = Math.min(best, distToSeg(p, pts[i], pts[i + 1]));
+    return best;
+  }
+  function distToSeg(p, a, b) {
+    var dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
+    var t = l2 ? Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2)) : 0;
+    var x = a[0] + t * dx, y = a[1] + t * dy;
+    return Math.hypot(p[0] - x, p[1] - y);
+  }
+
+  // ---------- drawing ----------
+  function render() {
+    var W = state.W, sw = Math.max(2, W / 400), r = Math.max(6, W / 160), fs = Math.max(14, W / 70);
+    var out = '';
+    state.features.forEach(function (f) {
+      if (f.kind !== 'ha') return;
+      var c = COLORS[f.surface], pts = f.coords.map(function (p) { return p.join(','); }).join(' ');
+      if (AREA[f.surface]) out += '<polygon points="' + pts + '" fill="' + c + '" fill-opacity=".22" stroke="' + c + '" stroke-width="' + sw + '"/>';
+      else out += '<polyline points="' + pts + '" fill="none" stroke="' + c + '" stroke-width="' + sw * 2.5 + '" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".8"/>';
+      var lb = labelPoint(f.coords);
+      out += text(lb[0], lb[1], 'HA ' + f.ha, fs, c);
+    });
+    state.features.forEach(function (f) {
+      if (f.kind !== 'sample') return;
+      out += '<circle cx="' + f.coords[0] + '" cy="' + f.coords[1] + '" r="' + r + '" fill="#111" stroke="#fff" stroke-width="' + sw + '"/>';
+      out += text(f.coords[0] + r * 1.4, f.coords[1] + fs * 0.35, f.sample, fs, '#111');
+    });
+    if (state.drawing.length) {
+      var c2 = COLORS[state.tool] || '#111', d = state.drawing;
+      var pts2 = d.map(function (p) { return p.join(','); }).join(' ');
+      out += '<polyline points="' + pts2 + '" fill="none" stroke="' + c2 + '" stroke-width="' + sw + '" stroke-dasharray="' + sw * 3 + '"/>';
+      d.forEach(function (p) { out += '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="' + r * 0.8 + '" fill="' + c2 + '"/>'; });
+    }
+    overlay.innerHTML = out;
+    renderList();
+  }
+  function text(x, y, s, fs, color) {
+    return '<text x="' + x + '" y="' + y + '" font-size="' + fs + '" font-family="system-ui,sans-serif" font-weight="700" fill="' + color +
+           '" stroke="#fff" stroke-width="' + (fs / 5) + '" paint-order="stroke">' + esc(s) + '</text>';
+  }
+  function labelPoint(pts) {
+    var sx = 0, sy = 0; pts.forEach(function (p) { sx += p[0]; sy += p[1]; });
+    return [sx / pts.length, sy / pts.length];
+  }
+
+  function renderList() {
+    var has = state.features.filter(function (f) { return f.kind === 'ha'; }).sort(function (a, b) { return a.ha - b.ha; });
+    var samples = state.features.filter(function (f) { return f.kind === 'sample'; });
+    var html = '';
+    if (has.length) {
+      html += '<h2>Areas and lines</h2>';
+      has.forEach(function (f) {
+        var n = samples.filter(function (s) { return s.ha === f.ha; }).length;
+        html += '<div class="item"><span class="sw" style="background:' + COLORS[f.surface] + '"></span><div class="txt"><b>HA ' + f.ha +
+                '</b> ' + esc(f.material) + ' <small>' + f.surface + (f.room ? ' - ' + esc(f.room) : '') + ' - ' + n + ' sample' + (n === 1 ? '' : 's') +
+                '</small></div><button type="button" data-del="' + f.id + '">Delete</button></div>';
+      });
+    }
+    if (samples.length) {
+      html += '<h2>Samples</h2>';
+      samples.forEach(function (s) {
+        html += '<div class="item"><span class="sw" style="background:#111"></span><div class="txt"><b>' + esc(s.sample) + '</b> <small>HA ' + s.ha +
+                '</small></div><button type="button" data-del="' + s.id + '">Delete</button></div>';
+      });
+    }
+    $('list').innerHTML = html;
+  }
+  $('list').addEventListener('click', function (e) {
+    var id = e.target.getAttribute && e.target.getAttribute('data-del');
+    if (!id) return;
+    var f = state.features.filter(function (x) { return x.id === id; })[0];
+    if (f && f.kind === 'ha' && state.features.some(function (s) { return s.kind === 'sample' && s.ha === f.ha; })) {
+      if (!confirm('HA ' + f.ha + ' has samples in it. Delete the area and its samples?')) return;
+      state.features = state.features.filter(function (x) { return !(x.kind === 'sample' && x.ha === f.ha); });
+    }
+    state.features = state.features.filter(function (x) { return x.id !== id; });
+    save(); render();
+  });
+
+  $('clearBtn').addEventListener('click', function () {
+    if (!state.features.length && !state.drawing.length) return;
+    if (!confirm('Clear everything drawn on this plan?')) return;
+    state.features = []; state.drawing = []; save(); updateButtons(); render(); say('Cleared.');
+  });
+
+  // ---------- save / restore (this browser only) ----------
+  function key() { return 'survey:' + state.planName; }
+  function save() {
+    try { localStorage.setItem(key(), JSON.stringify({ features: state.features, job: $('job').value, level: $('level').value })); } catch (e) {}
+  }
+  function restore() {
+    try {
+      var s = JSON.parse(localStorage.getItem(key()) || 'null');
+      if (s && s.features) {
+        state.features = s.features;
+        if (s.job && !$('job').value) $('job').value = s.job;
+        if (s.level && !$('level').value) $('level').value = s.level;
+      }
+    } catch (e) {}
+  }
+  $('job').addEventListener('change', save); $('level').addEventListener('change', save);
+
+  // ---------- export ----------
+  function toGeoJSON() {
+    var job = $('job').value.trim(), level = $('level').value.trim();
+    var features = state.features.map(function (f) {
+      if (f.kind === 'sample') {
+        return { type: 'Feature', geometry: { type: 'Point', coordinates: f.coords },
+                 properties: { kind: 'sample', sample: f.sample, ha: f.ha, level: level } };
+      }
+      var geom = AREA[f.surface]
+        ? { type: 'Polygon', coordinates: [f.coords.concat([f.coords[0]])] }
+        : { type: 'LineString', coordinates: f.coords };
+      return { type: 'Feature', geometry: geom,
+               properties: { kind: 'ha', ha: f.ha, surface: f.surface, material: f.material, room: f.room, level: level } };
+    });
+    return {
+      type: 'FeatureCollection',
+      survey: { version: 1, job: job, level: level, plan: state.planName, plan_size: [state.W, state.H],
+                coordinates: 'pixels on the plan image, origin top-left, y down', exported: new Date().toISOString() },
+      features: features
+    };
+  }
+  $('exportBtn').addEventListener('click', function () {
+    var job = $('job').value.trim(), level = $('level').value.trim();
+    if (!job) { say('Enter the job number before exporting.'); $('job').focus(); return; }
+    if (!state.features.length) { say('Nothing drawn yet.'); return; }
+    var name = job + ' Survey' + (level ? ' - ' + level : '') + '.geojson';
+    var blob = new Blob([JSON.stringify(toGeoJSON(), null, 1)], { type: 'application/geo+json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+    say('Exported ' + name + '. Share it into the job folder.');
+  });
+  window.__toGeoJSON = toGeoJSON;
+
+  // ---------- offline install ----------
+  // One visit with signal installs a copy on the phone; after that it opens
+  // with none. Only works from a web address (https, or localhost), not from
+  // a file opened directly, and it never sends anything anywhere.
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+    navigator.serviceWorker.register('sw.js').then(function () {
+      return navigator.serviceWorker.ready;
+    }).then(function () {
+      $('offline').textContent = '- saved on this phone, works without signal';
+    }).catch(function () {});
+  }
+
+  // ---------- misc ----------
+  function say(s) { status.textContent = s; }
+  function uid() { return Math.random().toString(36).slice(2, 10); }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+})();
+</script>
+</body>
+</html>
