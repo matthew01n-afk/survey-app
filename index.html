@@ -14,12 +14,12 @@
 
   Open this file on a phone or computer, pick the floor plan image, draw the
   homogeneous areas (HAs) and drop the sample points, then Export. The export
-  is a GeoJSON text file whose coordinates are pixels on the plan image
-  (origin top-left, y down). Nothing leaves the device until the surveyor
-  shares the exported file.
+  is one zip, "Sampling Locations - <level>.zip": the plan image and the drawing,
+  a GeoJSON text file whose coordinates are pixels on that image (origin
+  top-left, y down). Nothing leaves the device until the surveyor shares the zip.
 
-  Your work is saved in the browser as you go (localStorage), keyed by the
-  plan's filename, so a reload or an accidental close does not lose it.
+  Work is saved in the browser as it goes (localStorage), keyed by the plan's
+  contents. Pick the same plan again after closing the page and the drawing returns.
 -->
 <style>
   :root { --ink: #1c2330; --line: #d0d5dd; --bg: #f6f7f9; --accent: #1f5fbf; }
@@ -70,7 +70,9 @@
     <label>Job # <input id="job" type="text" placeholder="26-218" inputmode="numeric"></label>
     <label>Floor / level <input id="level" type="text" placeholder="Basement"></label>
     <button id="pickBtn" type="button">Choose plan image</button>
+    <button id="openBtn" type="button">Open saved</button>
     <input id="file" type="file" accept="image/*" style="display:none">
+    <input id="zipFile" type="file" accept=".zip,application/zip" style="display:none">
   </div>
 </header>
 
@@ -142,26 +144,38 @@
     var f = e.target.files && e.target.files[0];
     if (!f) return;
     var reader = new FileReader();
-    reader.onload = function (ev) { setPlan(ev.target.result, f.name); };
-    reader.readAsDataURL(f);
+    reader.onload = function (ev) {
+      var bytes = new Uint8Array(ev.target.result);
+      setPlan(URL.createObjectURL(new Blob([bytes], { type: f.type || 'image/jpeg' })), f.name, bytes);
+    };
+    reader.readAsArrayBuffer(f);
+    e.target.value = '';
   });
 
-  // Also used by the test harness: setPlan(url, name).
-  function setPlan(src, name) {
+  // The plan's own bytes are kept so the export carries the exact image the
+  // positions were drawn on.
+  function setPlan(src, name, bytes, after) {
+    state.planBytes = bytes;
     plan.onload = function () {
       state.W = plan.naturalWidth; state.H = plan.naturalHeight;
       state.planName = name;
+      state.drawing = [];
       overlay.setAttribute('viewBox', '0 0 ' + state.W + ' ' + state.H);
       stage.style.display = 'block';
       $('empty').style.display = 'none';
       $('exportBtn').disabled = false;
+      state.features = [];
+      if (after) {                       // opened from a zip: its drawing wins
+        after(); render();
+        say('Opened ' + name + ' with ' + state.features.length + ' shapes and samples.');
+        return;
+      }
       restore();
       render();
       say('Plan loaded (' + state.W + ' x ' + state.H + ' px). Pick a tool and tap the plan.');
     };
     plan.src = src;
   }
-  window.__setPlan = setPlan;
 
   // ---------- tools ----------
   var toolBtns = document.querySelectorAll('button.tool');
@@ -286,18 +300,29 @@
   $('formCancel').addEventListener('click', function () { $('modal').style.display = 'none'; formCb = null; });
 
   // ---------- geometry ----------
+  // The HA a sample tap most likely belongs to: a wall or pipe right under the
+  // finger first, then the smallest area containing the tap - so a sample in
+  // the utility room goes to the utility ceiling, not the tile that runs under
+  // the whole floor. The form shows the guess and the surveyor can change it.
   function findHA(pt) {
-    var areas = state.features.filter(function (f) { return f.kind === 'ha'; });
-    var i, f, best = null, bestD = state.W / 40;
-    for (i = 0; i < areas.length; i++) {
-      f = areas[i];
-      if (AREA[f.surface] && inPolygon(pt, f.coords)) return f;
+    var shapes = state.features.filter(function (f) { return f.kind === 'ha'; });
+    var i, f, line = null, lineD = state.W / 40, area = null, areaA = Infinity;
+    for (i = 0; i < shapes.length; i++) {
+      f = shapes[i];
+      if (!AREA[f.surface]) {
+        var d = distToLine(pt, f.coords);
+        if (d < lineD) { lineD = d; line = f; }
+      } else if (inPolygon(pt, f.coords)) {
+        var a = polyArea(f.coords);
+        if (a < areaA) { areaA = a; area = f; }
+      }
     }
-    for (i = 0; i < areas.length; i++) {
-      f = areas[i];
-      if (!AREA[f.surface]) { var d = distToLine(pt, f.coords); if (d < bestD) { bestD = d; best = f; } }
-    }
-    return best;
+    return line || area;
+  }
+  function polyArea(p) {
+    var s = 0;
+    for (var i = 0, j = p.length - 1; i < p.length; j = i++) s += (p[j][0] + p[i][0]) * (p[j][1] - p[i][1]);
+    return Math.abs(s / 2);
   }
   function inPolygon(p, poly) {
     var inside = false, n = poly.length;
@@ -395,7 +420,12 @@
   });
 
   // ---------- save / restore (this browser only) ----------
-  function key() { return 'survey:' + state.planName; }
+  // Keyed by the plan's contents, not its name: phones can give every picked
+  // photo the same name, and a new job must never open on the last job's drawing.
+  function key() {
+    var b = state.planBytes;
+    return 'survey:' + crc32(b) + '-' + b.length;
+  }
   function save() {
     try { localStorage.setItem(key(), JSON.stringify({ features: state.features, job: $('job').value, level: $('level').value })); } catch (e) {}
   }
@@ -432,19 +462,126 @@
       features: features
     };
   }
+  // ---------- zip, written and read by hand (no library) ----------
+  // Stored, not compressed: the plan is already a compressed image, and a
+  // stored zip is a few dozen lines anyone can read.
+  var CRC_TABLE = (function () {
+    var t = [], c, n, k;
+    for (n = 0; n < 256; n++) { c = n; for (k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(b) {
+    var c = 0xFFFFFFFF;
+    for (var i = 0; i < b.length; i++) c = CRC_TABLE[(c ^ b[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function makeZip(files) {           // [{name, data: Uint8Array}] -> Blob
+    var enc = new TextEncoder(), parts = [], central = [], offset = 0, d = new Date();
+    var time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    var date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    files.forEach(function (f) {
+      var name = enc.encode(f.name), crc = crc32(f.data), n = f.data.length;
+      var h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
+      h.setUint16(10, time, true); h.setUint16(12, date, true); h.setUint32(14, crc, true);
+      h.setUint32(18, n, true); h.setUint32(22, n, true); h.setUint16(26, name.length, true);
+      parts.push(new Uint8Array(h.buffer), name, f.data);
+      var c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true);
+      c.setUint16(12, time, true); c.setUint16(14, date, true); c.setUint32(16, crc, true);
+      c.setUint32(20, n, true); c.setUint32(24, n, true); c.setUint16(28, name.length, true); c.setUint32(42, offset, true);
+      central.push(new Uint8Array(c.buffer), name);
+      offset += 30 + name.length + n;
+    });
+    var size = central.reduce(function (s, a) { return s + a.length; }, 0);
+    var e = new DataView(new ArrayBuffer(22));
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+    e.setUint32(12, size, true); e.setUint32(16, offset, true);
+    return new Blob(parts.concat(central, [new Uint8Array(e.buffer)]), { type: 'application/zip' });
+  }
+  async function readZip(buf) {       // ArrayBuffer -> [{name, data}]
+    var dv = new DataView(buf), u8 = new Uint8Array(buf), dec = new TextDecoder(), out = [];
+    var i = buf.byteLength - 22;
+    while (i >= 0 && dv.getUint32(i, true) !== 0x06054b50) i--;
+    if (i < 0) throw new Error('not a zip file');
+    var count = dv.getUint16(i + 10, true), p = dv.getUint32(i + 16, true);
+    for (var k = 0; k < count; k++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('damaged zip file');
+      var method = dv.getUint16(p + 10, true), size = dv.getUint32(p + 20, true);
+      var nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
+      var at = dv.getUint32(p + 42, true), name = dec.decode(u8.subarray(p + 46, p + 46 + nlen));
+      var start = at + 30 + dv.getUint16(at + 26, true) + dv.getUint16(at + 28, true);
+      var data = u8.slice(start, start + size);
+      if (method === 8) {             // re-zipped somewhere along the way
+        data = new Uint8Array(await new Response(new Blob([data]).stream()
+          .pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+      } else if (method !== 0) {
+        throw new Error('this zip uses a compression the app cannot read');
+      }
+      out.push({ name: name, data: data });
+      p += 46 + nlen + xlen + clen;
+    }
+    return out;
+  }
+
+  // ---------- export: one zip, the drawing and the plan it was drawn on ----------
+  function zipName(level) { return 'Sampling Locations' + (level ? ' - ' + level.replace(/[\\/:*?"<>|]/g, '') : '') + '.zip'; }
+
   $('exportBtn').addEventListener('click', function () {
     var job = $('job').value.trim(), level = $('level').value.trim();
     if (!job) { say('Enter the job number before exporting.'); $('job').focus(); return; }
     if (!state.features.length) { say('Nothing drawn yet.'); return; }
-    var name = job + ' Survey' + (level ? ' - ' + level : '') + '.geojson';
-    var blob = new Blob([JSON.stringify(toGeoJSON(), null, 1)], { type: 'application/geo+json' });
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = name;
-    document.body.appendChild(a); a.click();
-    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
-    say('Exported ' + name + '. Share it into the job folder.');
+    try {
+      var planName = state.planName;
+      var geoName = job + ' Survey' + (level ? ' - ' + level : '') + '.geojson';
+      var geo = toGeoJSON(); geo.survey.plan = planName;
+      var blob = makeZip([
+        { name: geoName, data: new TextEncoder().encode(JSON.stringify(geo, null, 1)) },
+        { name: planName, data: state.planBytes }
+      ]);
+      var name = zipName(level);
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = name;
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      say('Exported ' + name + ' (the drawing and the plan). Share it into the job folder.');
+    } catch (err) {
+      say('Could not export: ' + err.message);
+    }
   });
-  window.__toGeoJSON = toGeoJSON;
+
+  // ---------- open a Sampling Locations zip, to check or correct it ----------
+  $('openBtn').addEventListener('click', function () { $('zipFile').click(); });
+  $('zipFile').addEventListener('change', async function (e) {
+    var f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    try {
+      var files = await readZip(await f.arrayBuffer());
+      var gj = files.filter(function (x) { return /\.geojson$/i.test(x.name); })[0];
+      if (!gj) throw new Error('no drawing (.geojson) inside');
+      var data = JSON.parse(new TextDecoder().decode(gj.data)), meta = data.survey || {};
+      var img = files.filter(function (x) { return x.name === meta.plan; })[0]
+             || files.filter(function (x) { return /\.(jpe?g|png|gif|webp|bmp)$/i.test(x.name); })[0];
+      if (!img) throw new Error('no plan image inside');
+      var feats = fromGeoJSON(data);
+      $('job').value = meta.job || ''; $('level').value = meta.level || '';
+      var type = /\.png$/i.test(img.name) ? 'image/png' : 'image/jpeg';
+      setPlan(URL.createObjectURL(new Blob([img.data], { type: type })), img.name, img.data, function () {
+        state.features = feats; save();
+      });
+    } catch (err) {
+      say('Could not open ' + f.name + ': ' + err.message);
+    }
+  });
+  function fromGeoJSON(data) {
+    return (data.features || []).map(function (ft) {
+      var p = ft.properties || {}, g = ft.geometry || {};
+      if (p.kind === 'sample') return { id: uid(), kind: 'sample', sample: String(p.sample), ha: +p.ha, coords: g.coordinates };
+      var c = g.type === 'Polygon' ? g.coordinates[0].slice(0, -1) : g.coordinates;
+      return { id: uid(), kind: 'ha', surface: p.surface, ha: +p.ha, material: p.material || '', room: p.room || '', coords: c };
+    });
+  }
 
   // ---------- offline install ----------
   // One visit with signal installs a copy on the phone; after that it opens
